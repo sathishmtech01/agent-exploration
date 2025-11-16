@@ -37,6 +37,8 @@
     2. Other models (fill later)
     Choose model (1, 2): 2
 
+    adk run src/agent2
+
     Please see below guide to configure other models:
     https://google.github.io/adk-docs/agents/models
     Agent created in /Users/sathishkumarchandran/IdeaProjects/agent-exploration/src/agent2:
