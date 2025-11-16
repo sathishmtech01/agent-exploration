@@ -37,8 +37,6 @@
     2. Other models (fill later)
     Choose model (1, 2): 2
 
-    adk run src/agent2
-
     Please see below guide to configure other models:
     https://google.github.io/adk-docs/agents/models
     Agent created in /Users/sathishkumarchandran/IdeaProjects/agent-exploration/src/agent2:
@@ -46,3 +44,14 @@
      - __init__.py
      - agent.py
 
+#### Run adk agent
+    (agents-exp) (base) sathishkumarchandran@Sathishs-MacBook-Air src % adk run agent2
+![](img/adk_cli.png)
+    
+    (agents-exp) sathishkumarchandran@Sathishs-MacBook-Air agent-exploration % cd src 
+    (agents-exp) sathishkumarchandran@Sathishs-MacBook-Air src % adk web
+    
+![](img/adk_web.png)
+        
+    http://localhost:8000/docs
+    http://localhost:8000/dev-ui

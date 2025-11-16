@@ -2,3 +2,4 @@
 /.venv/
 /.env
 /src/*/.env
+/src/agent/*/.env
