@@ -28,6 +28,7 @@
         |-pyproject.toml
         |-Readme.md
         |-uv.lock
+        |-.env.example
 
 #### Add agents to the src folder
 
@@ -55,3 +56,7 @@
         
     http://localhost:8000/docs
     http://localhost:8000/dev-ui
+
+
+#### Reference
+    https://github.com/google/adk-samples/tree/main
