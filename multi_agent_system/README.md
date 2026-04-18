@@ -818,3 +818,7 @@ Then register it with the RootOrchestrator — it becomes a peer of `domain_orch
 ⚡ [EXECUTION]  execute::code_agent           │ agent=code_agent  │ 3800ms
    💭 Step 2 (retry 1) — Reward: 74% — kept retry result (74% > 38%)
 ```
+
+## Execution
+
+![img.png](img/img.png)
