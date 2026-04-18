@@ -30,6 +30,8 @@ from agents.specialist_agents import (
 )
 from config.llm_config import LLMConfig, get_llm_config
 from context.context_manager import ContextManager
+from reward.reward_engine import RewardEngine
+from security.security_layer import SecurityLayer
 from trace.tracer import AgentTracer
 
 
@@ -50,6 +52,8 @@ def build_domain_orchestrator(
     context_manager: ContextManager,
     tracer: AgentTracer,
     llm_config: LLMConfig | None = None,
+    security: SecurityLayer | None = None,
+    reward_engine: RewardEngine | None = None,
 ) -> DomainOrchestrator:
     """
     Build and return a fully wired DomainOrchestrator for the 'tech' domain.
@@ -132,6 +136,8 @@ def build_domain_orchestrator(
         context_manager=context_manager,
         tracer=tracer,
         llm_config=cfg,
+        security=security,
+        reward_engine=reward_engine,
     )
 
     return orchestrator

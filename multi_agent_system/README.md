@@ -1,7 +1,7 @@
 # Google ADK — Custom Multi-Agent System
 
 A production-quality multi-agent system built on **Google Agent Development Kit (ADK) 1.x**.  
-Implements a **custom Planner + Coordinator** orchestrator with full trace, context propagation, and learning from past executions.
+Implements a **custom Planner + Coordinator** orchestrator with full trace, context propagation, learning from past executions, **defense-in-depth security at every boundary**, and a **reward engine that scores and improves agent performance automatically**.
 
 ---
 
@@ -12,20 +12,31 @@ User Query (AgentInput)
         │
         ▼
 ┌─────────────────────────────────────────────────────────────────┐
+│  SecurityLayer.check_input()   ← prompt injection / PII / rate  │
+└────────────────────┬────────────────────────────────────────────┘
+                     │
+        ▼
+┌─────────────────────────────────────────────────────────────────┐
 │  RootOrchestrator  [Level 1 — custom BaseAgent]                 │
 │                                                                 │
-│  ① PLAN   — LLM produces ExecutionPlan (which agents + why)    │
-│  ② ROUTE  — Logged routing decision with reasoning             │
-│  ③ EXECUTE — Call agents, capture results in session state     │
+│  ① PLAN      — LLM produces ExecutionPlan (agents + why)       │
+│              + RewardEngine.performance_for_prompt() injected   │
+│  ② ROUTE     — Logged routing decision with reasoning           │
+│  ③ EXECUTE   — SecurityLayer.check_request()                   │
+│              → Call agent                                       │
+│              → SecurityLayer.check_response()                   │
+│              → RewardEngine.score_response()                    │
+│              → Auto-retry if reward < 0.45                      │
 │  ④ CONSOLIDATE — summary_agent merges all outputs              │
-│  ⑤ LEARN  — Record outcome in learning_store.json              │
+│              → SecurityLayer.check_output()                     │
+│  ⑤ LEARN     — Record outcome + reward_score in               │
+│                learning_store.json + reward_store.json          │
 └────────────────────┬────────────────────────────────────────────┘
                      │ may delegate to ↓
           ┌──────────▼──────────────────────────────────────────┐
           │  DomainOrchestrator [Level 2 — mimics RootOrchestrator] │
           │  (tech domain: research + code + data)               │
-          │                                                      │
-          │  Same 5-step loop — planner is domain-scoped        │
+          │  Shares SecurityLayer + RewardEngine from Root       │
           └──────┬──────────────┬──────────────┬────────────────┘
                  │              │              │
         ┌────────▼──┐  ┌────────▼──┐  ┌───────▼───┐
@@ -125,15 +136,25 @@ learning_store.json
       ├── plan_reasoning   : why the plan was built that way
       ├── success          : true / false
       ├── feedback         : what went wrong (if failed)
-      └── correction       : what should have been done instead
+      ├── correction       : what should have been done instead
+      ├── reward_score     : composite session reward 0.0–1.0 (from RewardEngine)
+      ├── session_score    : weighted average across all agents
+      └── agent_scores     : {"agent_name": score, ...} per-agent breakdown
 ```
 
-The **planner prompt** includes the 3-5 most relevant past learnings:
+The **planner prompt** includes the 3-5 most relevant past learnings with reward context:
 ```
 === PAST LEARNINGS ===
 [FAILURE] "translate data analysis to French"
   Agents used  : research_agent, language_agent
+  Reward score : 32%
+  Agent scores : research_agent=61%, language_agent=28%
   !! CORRECTION: Use data_agent first, THEN language_agent for translation
+
+[SUCCESS] "explain transformers + write attention code"
+  Agents used  : domain_orchestrator → research_agent, code_agent
+  Reward score : 87%
+  Agent scores : research_agent=91%, code_agent=83%
 === END LEARNINGS ===
 ```
 
@@ -146,6 +167,8 @@ context_manager.record_failure(
     reasoning="thought research alone was enough",
     feedback="needed code example too",
     correction="route to domain_orchestrator for combined research+code",
+    reward_score=0.32,
+    agent_scores={"research_agent": 0.61},
 )
 ```
 
@@ -171,6 +194,188 @@ This means when the Root Orchestrator delegates to it, you see **two nested plan
 🔗 [CONSOLIDATION] RootOrchestrator summary
 ```
 
+### 7. Security Layer — Defense at Every Boundary
+
+`SecurityLayer` (`security/security_layer.py`) guards **four boundary points** in every request cycle:
+
+```
+User Input ──► [check_input]
+                 │
+                 ▼
+              AgentRequest ──► [check_request]
+                                 │
+                                 ▼
+                              LLM Agent
+                                 │
+                                 ▼
+                              AgentResponse ──► [check_response]
+                                                  │
+                                                  ▼
+                                               Final Text ──► [check_output]
+                                                                 │
+                                                                 ▼
+                                                              Caller
+```
+
+**Checks performed at each boundary:**
+
+| Boundary | Checks |
+|---|---|
+| `check_input` | Rate limiting, max length, prompt injection patterns (14 signatures), shell/SQL/XSS injection, PII redaction |
+| `check_request` | Schema completeness, injection in task + context values, PII in task text |
+| `check_response` | Harmful output patterns (synthesis/exploit/hacking instructions), secrets leaking in output |
+| `check_output` | Max length truncation, harmful content, PII in final response |
+
+**Security signals:**
+- `SecurityViolation.severity` : `low` | `medium` | `high` | `critical`
+- `SecurityViolation.blocked`  : `True` → request is rejected; `False` → warning only, PII redacted
+- All violations logged to `security.get_violation_log()` for audit
+
+**Prompt injection patterns detected:**
+```
+- "Ignore all previous instructions..."
+- "You are now / Act as [persona] without restriction"
+- "system prompt:" / system XML tags
+- "jailbreak / DAN mode / developer mode"
+- "Disregard your safety guidelines"
+- Verbatim secret extraction attempts
+- Shell: rm -rf, curl, eval(), os.system()
+- SQL: UNION SELECT, DROP TABLE, OR 1=1
+- XSS: <script>, javascript:, onerror=
+```
+
+**PII auto-redacted before any LLM sees it:**
+```
+[EMAIL]        user@example.com
+[PHONE]        +1-555-123-4567
+[SSN]          123-45-6789
+[CARD]         4111 1111 1111 1111
+[API_KEY]      sk-live-xxxxxxxxxxxxxxxxxxxx
+[PASSWORD]     password=secret123
+[SECRET]       api_key=abc123
+[HASH_OR_KEY]  a3f8d9e2b1c4... (32–64 hex chars)
+```
+
+**Using SecurityLayer directly:**
+```python
+from security.security_layer import SecurityLayer
+
+security = SecurityLayer(
+    max_input_chars=8000,       # max user query length
+    rate_limit_max=30,          # requests per session per minute
+    redact_pii=True,            # auto-redact PII in all text
+    block_injections=True,      # block prompt injection attempts
+    block_malicious_code=True,  # block shell/SQL/XSS patterns
+)
+
+result = security.check_input(user_query, session_id="user_123")
+if result.has_blocking:
+    print("Blocked:", result.summary())
+else:
+    safe_query = result.sanitized_text or user_query
+
+# View full audit log
+for violation in security.get_violation_log():
+    print(violation)
+
+# Session rate-limit stats
+print(security.session_stats("user_123"))
+```
+
+---
+
+### 8. Reward Engine — Performance Scoring and Improvement Loop
+
+`RewardEngine` (`reward/reward_engine.py`) scores every agent execution and feeds performance data back into the system to improve routing decisions over time.
+
+**How scoring works:**
+
+Each `AgentResponse` receives a composite reward score (0.0–1.0) built from five weighted signals:
+
+| Signal | Weight | What it measures |
+|---|---|---|
+| Confidence | 30% | Raw `response.confidence` from the agent |
+| Status | 25% | `success=1.0`, `partial=0.6`, `failed=0.0` |
+| Output quality | 25% | Length (≥500 chars = 1.0) + key_points count + structured_data richness |
+| Latency | 10% | Penalty for responses slower than 10s |
+| Limitations | 10% | Each limitation item reduces score by 0.05 |
+
+Each retry attempt applies an additional −0.05 penalty to discourage unnecessary retries.
+
+**Auto-retry on low reward:**
+
+```
+composite_score < 0.45 AND retries < 2
+   → refine_task_prompt()  (adds: prior attempt output, limitations, score)
+   → re-run agent with refined prompt
+   → keep the higher-scoring result
+```
+
+**Planner feedback loop:**
+
+After enough executions, `performance_for_prompt()` is injected into every planning LLM call:
+```
+=== AGENT PERFORMANCE (use to prefer high-reliability agents) ===
+  research_agent : avg=87%  recent=91%  runs=23  reliability=high
+  code_agent     : avg=82%  recent=85%  runs=18  reliability=high
+  data_agent     : avg=64%  recent=70%  runs= 7  reliability=medium
+  language_agent : avg=55%  recent=48%  runs= 4  reliability=low
+=== END PERFORMANCE ===
+```
+
+The planner LLM uses this to prefer high-reliability agents when multiple options could serve a query.
+
+**Learning store integration:**
+
+Every execution now records reward data alongside the routing decision:
+```json
+{
+  "query_summary": "Explain transformers...",
+  "query_type": "mixed",
+  "agents_used": ["domain_orchestrator", "research_agent"],
+  "success": true,
+  "reward_score": 0.83,
+  "session_score": 0.83,
+  "agent_scores": {
+    "research_agent": 0.87,
+    "code_agent": 0.79
+  }
+}
+```
+
+Future planners see both the routing choice AND how well it performed.
+
+**Using RewardEngine directly:**
+```python
+from reward.reward_engine import RewardEngine
+
+reward = RewardEngine(persist=True)  # saves to reward_store.json
+
+# Score a response
+signal = reward.score_response(
+    response=agent_response,
+    duration_ms=1840.0,
+    trace_id="trace_abc",
+    session_id="user_session",
+)
+print(f"Score: {signal.composite_score:.0%}")
+print(f"Breakdown: {signal.reasoning}")
+
+# Check if retry is warranted
+if reward.should_retry(signal):
+    retry_count = reward.record_retry(signal.request_id)
+    refined_task = reward.refine_task_prompt(original_task, signal, agent_response)
+    # ... re-run agent with refined_task
+
+# Per-agent performance stats
+for agent, stats in reward.get_agent_performance().items():
+    print(f"{agent}: avg={stats['avg_score']:.0%} reliability={stats['reliability']}")
+```
+
+**Reward store (`reward_store.json`):**
+
+Persistent record of every scored execution — grows with each run. The `RewardEngine` loads this on startup so performance history survives restarts. Excluded from git via `.gitignore`.
+
 ---
 
 ## File Structure
@@ -178,22 +383,34 @@ This means when the Root Orchestrator delegates to it, you see **two nested plan
 ```
 multi_agent_system/
 ├── main.py                        Entry point + 3 demo queries + interactive mode
+├── agent.py                       ADK web UI entry point (exposes root_agent)
 ├── learning_store.json            Auto-created; grows with each run
+├── reward_store.json              Auto-created; per-agent reward records
 │
 ├── models/
 │   ├── io_models.py               AgentInput, AgentOutput, AgentTaskResult
+│   ├── agent_message.py           AgentRequest, AgentResponse (per-agent boundary contract)
 │   └── trace_models.py            TraceEntry, TraceSession, ExecutionPlan, StepType
 │
+├── security/
+│   └── security_layer.py          SecurityLayer — defense-in-depth for all boundaries
+│
+├── reward/
+│   └── reward_engine.py           RewardEngine — scoring, auto-retry, performance tracking
+│
 ├── context/
-│   └── context_manager.py         ContextManager + LearningStore
+│   └── context_manager.py         ContextManager + LearningStore (with reward_score field)
 │
 ├── trace/
 │   └── tracer.py                  AgentTracer — Rich-rendered trace output
 │
+├── config/
+│   └── llm_config.py              Multi-provider LLM config (OpenAI / Groq / Gemini)
+│
 └── agents/
     ├── registry.py                AgentRegistry + AgentCapability
     ├── specialist_agents.py       research, code, data, language, summary agents
-    ├── base_orchestrator.py       BaseOrchestrator — 5-step loop (plan→route→execute→consolidate→learn)
+    ├── base_orchestrator.py       BaseOrchestrator — full 7-step loop
     ├── domain_orchestrator.py     DomainOrchestrator (tech) + build_domain_orchestrator()
     └── root_orchestrator.py       RootOrchestrator + build_root_orchestrator()
 ```
@@ -459,13 +676,18 @@ asyncio.run(main())
 
 | Symbol | Step | What it shows |
 |--------|------|---------------|
-| `📋` | PLANNING | Full JSON execution plan — agents chosen + WHY |
+| `📋` | PLANNING | Full JSON execution plan — agents chosen + WHY + performance hints |
 | `🔀` | ROUTING | Which agent was selected, confidence score |
-| `⚡` | EXECUTION | Agent running — input task, response preview, duration |
+| `⚡` | EXECUTION | Agent running — input task, response preview, reward score, duration |
 | `🔗` | CONSOLIDATION | Results from all agents being merged |
-| `📚` | LEARNING | Outcome saved to `learning_store.json` |
+| `📚` | LEARNING | Outcome + reward scores saved to `learning_store.json` |
+| `❌` | ERROR | Security block or agent failure with reason |
 
-After each run, `learning_store.json` accumulates past decisions. The next query's planner reads these and adjusts routing to avoid past mistakes.
+Security events appear as `❌ [ERROR] security_block::agent_name` with the violation detail.  
+Reward scores appear inline with each execution step: `Reward: 87% (conf=0.90 status=1.00 quality=0.82 ...)`.  
+Auto-retry appears as `⚡ [EXECUTION] retry::code_agent::1` when a low-score response is re-run.
+
+After each run, `learning_store.json` accumulates past decisions **with reward scores**. The next query's planner reads these and adjusts routing to avoid past mistakes and prefer high-performing agents.
 
 ---
 
@@ -539,6 +761,7 @@ Then register it with the RootOrchestrator — it becomes a peer of `domain_orch
    │    └─ domain_orchestrator — delegate full tech query
    │         Why: query requires both research and code; domain_orchestrator handles both
    └─ Alternatives  : research_agent alone (insufficient — no code)
+   └─ Performance   : research_agent avg=87% (high), code_agent avg=82% (high)
 
 🔀 [ROUTING]    route_to::domain_orchestrator │ agent=root_orchestrator │ 2ms
    💭 Query needs research + code; domain_orchestrator plans internally
@@ -546,12 +769,24 @@ Then register it with the RootOrchestrator — it becomes a peer of `domain_orch
    📋 EXECUTION PLAN  [DomainOrchestrator]
    ...
 
-   ⚡ [EXECUTION]  execute::research_agent     │ agent=research_agent  │ 1843ms
-   ⚡ [EXECUTION]  execute::code_agent         │ agent=code_agent      │ 2210ms
-   🔗 [CONSOLIDATION] consolidate_results      │ agent=domain_orchestrator │ 1120ms
+📤 REQUEST  DomainOrchestrator → research_agent  (step 1 · req_3a7f...)
+   { "task": "Research transformer architecture...", "context": {} }
 
-🔗 [CONSOLIDATION] consolidate_results         │ agent=root_orchestrator   │ 980ms
-📚 [LEARNING]      record_learning             │ agent=root_orchestrator   │ 0ms
+   ⚡ [EXECUTION]  execute::research_agent  │ agent=research_agent  │ 1843ms
+   💭 Step 1 — Reward: 87% (conf=0.90 status=1.00 quality=0.82 latency=0.95)
+
+📤 REQUEST  DomainOrchestrator → code_agent  (step 2 · req_9b2c...)
+   { "task": "Write Python attention...", "context": {"research_agent_result": "..."} }
+
+   ⚡ [EXECUTION]  execute::code_agent  │ agent=code_agent  │ 2210ms
+   💭 Step 2 — Reward: 79% (conf=0.85 status=1.00 quality=0.71 latency=0.88)
+
+   🔗 [CONSOLIDATION] consolidate_results  │ agent=domain_orchestrator │ 1120ms
+
+🔗 [CONSOLIDATION] consolidate_results     │ agent=root_orchestrator   │ 980ms
+📚 [LEARNING]      record_learning         │ agent=root_orchestrator   │ 0ms
+   💭 Intent=mixed, agents=[research_agent, code_agent], session_reward=83%,
+      agent_rewards={research_agent: 87%, code_agent: 79%}
 
 ┌─ TRACE SUMMARY ─────────────────────────────┐
 │ Trace ID  │ trace_abc123def                  │
@@ -559,6 +794,27 @@ Then register it with the RootOrchestrator — it becomes a peer of `domain_orch
 │ Duration  │ 6890 ms                          │
 │ Agents    │ domain_orchestrator → research   │
 │           │ → code_agent → summary           │
-│ Steps     │ 8                                │
+│ Steps     │ 10                               │
 └─────────────────────────────────────────────┘
+```
+
+### Security block example
+
+```
+❌ [ERROR]  security_block::code_agent  │ agent=root_orchestrator  │ 0ms
+   💭 SecurityLayer blocked request: CRITICAL:prompt_injection:ignore_instructions
+   ✖  [SECURITY BLOCKED] Request blocked: CRITICAL:prompt_injection:ignore_instructions
+```
+
+### Auto-retry example
+
+```
+⚡ [EXECUTION]  execute::code_agent           │ agent=code_agent  │ 4100ms
+   💭 Step 2 — Reward: 38% (conf=0.50 status=0.60 quality=0.22 ...)
+
+⚡ [EXECUTION]  retry::code_agent::1          │ agent=code_agent  │ 0ms
+   💭 Low reward score: 38% — retrying with refined prompt (attempt 1)
+
+⚡ [EXECUTION]  execute::code_agent           │ agent=code_agent  │ 3800ms
+   💭 Step 2 (retry 1) — Reward: 74% — kept retry result (74% > 38%)
 ```

@@ -33,6 +33,9 @@ class LearningEntry(BaseModel):
     success: bool
     feedback: Optional[str] = None
     correction: Optional[str] = None  # what the orchestrator should do differently
+    reward_score: Optional[float] = None       # composite 0.0–1.0 from RewardEngine
+    session_score: Optional[float] = None      # session-level reward
+    agent_scores: Optional[Dict[str, float]] = None  # per-agent breakdown
 
 
 class LearningStore:
@@ -78,10 +81,20 @@ class LearningStore:
         lines = ["=== PAST LEARNINGS (use to improve routing decisions) ==="]
         for e in entries:
             status = "SUCCESS" if e.success else "FAILURE"
+            reward_str = f"  Reward score : {e.reward_score:.0%}" if e.reward_score is not None else ""
+            agent_scores_str = ""
+            if e.agent_scores:
+                agent_scores_str = "  Agent scores : " + ", ".join(
+                    f"{a}={s:.0%}" for a, s in e.agent_scores.items()
+                )
             lines.append(f"\n[{status}] {e.query_summary}")
             lines.append(f"  Query type   : {e.query_type}")
             lines.append(f"  Agents used  : {', '.join(e.agents_used)}")
             lines.append(f"  Reasoning    : {e.plan_reasoning}")
+            if reward_str:
+                lines.append(reward_str)
+            if agent_scores_str:
+                lines.append(agent_scores_str)
             if not e.success and e.correction:
                 lines.append(f"  !! CORRECTION: {e.correction}")
         lines.append("=== END OF LEARNINGS ===")
@@ -123,6 +136,9 @@ class ContextManager:
         query_type: str,
         agents_used: List[str],
         reasoning: str,
+        reward_score: Optional[float] = None,
+        session_score: Optional[float] = None,
+        agent_scores: Optional[Dict[str, float]] = None,
     ) -> None:
         self.learning_store.add(
             LearningEntry(
@@ -131,6 +147,9 @@ class ContextManager:
                 agents_used=agents_used,
                 plan_reasoning=reasoning,
                 success=True,
+                reward_score=reward_score,
+                session_score=session_score,
+                agent_scores=agent_scores,
             )
         )
 
@@ -142,6 +161,9 @@ class ContextManager:
         reasoning: str,
         feedback: str,
         correction: Optional[str] = None,
+        reward_score: Optional[float] = None,
+        session_score: Optional[float] = None,
+        agent_scores: Optional[Dict[str, float]] = None,
     ) -> None:
         self.learning_store.add(
             LearningEntry(
@@ -152,6 +174,9 @@ class ContextManager:
                 success=False,
                 feedback=feedback,
                 correction=correction,
+                reward_score=reward_score,
+                session_score=session_score,
+                agent_scores=agent_scores,
             )
         )
 

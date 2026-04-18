@@ -19,8 +19,9 @@ build/
 venv/
 env/
 
-# Learning store (runtime data — do not commit)
+# Runtime data stores — do not commit
 learning_store.json
+reward_store.json
 
 # ADK runtime data
 .adk/

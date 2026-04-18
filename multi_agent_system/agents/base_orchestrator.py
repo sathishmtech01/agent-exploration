@@ -33,6 +33,8 @@ from pydantic import Field
 from context.context_manager import ContextManager
 from models.agent_message import AgentRequest, AgentResponse
 from models.trace_models import AgentDecision, ExecutionPlan, StepType
+from reward.reward_engine import RewardEngine, RewardSignal
+from security.security_layer import SecurityLayer, SecurityCheckResult
 from trace.tracer import AgentTracer
 
 # --------------------------------------------------------------------------- #
@@ -85,10 +87,22 @@ class BaseOrchestrator(BaseAgent):
     context_manager: Any = Field(default=None)
     tracer: Any = Field(default=None)
     llm_config: Any = Field(default=None)   # LLMConfig from config.llm_config
+    security: Any = Field(default=None)     # SecurityLayer (optional, created if not provided)
+    reward_engine: Any = Field(default=None)  # RewardEngine (optional, created if not provided)
 
     model_config = {"arbitrary_types_allowed": True}
 
     # ------------------------------------------------------------------ utils
+
+    def _get_security(self) -> SecurityLayer:
+        if self.security is None:
+            object.__setattr__(self, "security", SecurityLayer())
+        return self.security
+
+    def _get_reward(self) -> RewardEngine:
+        if self.reward_engine is None:
+            object.__setattr__(self, "reward_engine", RewardEngine())
+        return self.reward_engine
 
     def _get_user_query(self, ctx: InvocationContext) -> str:
         if ctx.user_content and ctx.user_content.parts:
@@ -134,6 +148,7 @@ class BaseOrchestrator(BaseAgent):
 
         agent_map = self.registry.context_for_planner()
         learnings = self.context_manager.get_learnings_for_prompt()
+        performance_hints = self._get_reward().performance_for_prompt()
         session_ctx_str = json.dumps(session_context, indent=2) if session_context else "{}"
 
         prompt = f"""You are an expert AI orchestrator planner for the "{self.domain}" domain.
@@ -141,7 +156,7 @@ class BaseOrchestrator(BaseAgent):
 {agent_map}
 
 {learnings}
-
+{performance_hints}
 SESSION CONTEXT (from prior agent runs in this session):
 {session_ctx_str}
 
@@ -327,10 +342,33 @@ Rules:
             step=step,
             ctx=ctx,
         )
+
+        # ── 1b. Security check on outgoing request ──────────────────────────
+        sec = self._get_security()
+        req_check = sec.check_request(request)
+        if req_check.sanitized_text:
+            request = request.model_copy(update={"task": req_check.sanitized_text})
+        if req_check.has_blocking:
+            self.tracer.log(
+                trace_id=trace_id, orchestrator=self.orchestrator_name,
+                step_type=StepType.ERROR, step_name=f"security_block::{agent_name}",
+                agent=agent_name, input_data=task,
+                output_data=req_check.summary(),
+                reasoning=f"SecurityLayer blocked request: {req_check.summary()}",
+                success=False, error=req_check.summary(),
+            )
+            return AgentResponse(
+                request_id=request.request_id, agent_name=agent_name,
+                status="failed",
+                output=f"[SECURITY BLOCKED] {req_check.summary()}",
+                confidence=0.0,
+                limitations=[req_check.summary()],
+            )
+
         request_json = request.model_dump_json(indent=2)
 
         # ── 2. Inject into session state (template variables) ───────────────
-        ctx.session.state[f"{agent_name}_task"] = task
+        ctx.session.state[f"{agent_name}_task"] = request.task
         ctx.session.state[f"{agent_name}_request_context"] = request.to_prompt_context()
 
         # Log the outgoing request
@@ -369,6 +407,66 @@ Rules:
             if not response.request_id:
                 response.request_id = request.request_id
 
+        # ── 4b. Security check on response ──────────────────────────────────
+        resp_check = sec.check_response(response)
+        if resp_check.sanitized_text:
+            response = response.model_copy(update={"output": resp_check.sanitized_text})
+        if resp_check.has_blocking:
+            response = response.model_copy(update={
+                "status": "failed",
+                "output": f"[SECURITY BLOCKED RESPONSE] {resp_check.summary()}",
+                "confidence": 0.0,
+                "limitations": [resp_check.summary()],
+            })
+
+        # ── 4c. Reward scoring ───────────────────────────────────────────────
+        reward = self._get_reward()
+        reward_signal = reward.score_response(
+            response=response,
+            duration_ms=duration,
+            trace_id=trace_id,
+            session_id=ctx.session.id,
+            retry_count=step - 1,
+        )
+
+        # ── 4d. Auto-retry on low reward (non-summary agents only) ───────────
+        if agent_name != "summary_agent" and reward.should_retry(reward_signal):
+            retry_count = reward.record_retry(request.request_id)
+            refined_task = reward.refine_task_prompt(task, reward_signal, response)
+            self.tracer.log(
+                trace_id=trace_id, orchestrator=self.orchestrator_name,
+                step_type=StepType.EXECUTION,
+                step_name=f"retry::{agent_name}::{retry_count}",
+                agent=agent_name,
+                input_data=f"Low reward score: {reward_signal.composite_score:.0%}",
+                output_data=f"Retrying with refined prompt (attempt {retry_count})",
+                reasoning=reward_signal.reasoning,
+                duration_ms=0,
+            )
+            ctx.session.state[f"{agent_name}_task"] = refined_task
+            ctx.session.state[f"{agent_name}_request_context"] = request.to_prompt_context()
+            retry_raw = ""
+            try:
+                async for event in agent.run_async(ctx):
+                    if event.is_final_response():
+                        retry_raw = _extract_text(event)
+            except Exception:
+                pass
+            if not retry_raw:
+                retry_raw = ctx.session.state.get(f"{agent_name}_result", "")
+            if retry_raw:
+                retry_response = self._parse_agent_response(retry_raw, agent_name, request.request_id)
+                retry_signal = reward.score_response(
+                    response=retry_response,
+                    duration_ms=duration,
+                    trace_id=trace_id,
+                    session_id=ctx.session.id,
+                    retry_count=retry_count,
+                )
+                if retry_signal.composite_score > reward_signal.composite_score:
+                    response = retry_response
+                    reward_signal = retry_signal
+
         response_json = response.model_dump_json(indent=2)
 
         # ── 5. Log request + response in trace ───────────────────────────────
@@ -381,11 +479,19 @@ Rules:
             agent=agent_name,
             input_data=request_json,
             output_data=response_json,
-            reasoning=f"Step {step} — task dispatched and structured JSON response received",
+            reasoning=(
+                f"Step {step} — task dispatched and structured JSON response received. "
+                f"Reward: {reward_signal.composite_score:.0%} ({reward_signal.reasoning})"
+            ),
             duration_ms=duration,
             success=error is None,
             error=error,
-            context_used={"request_id": request.request_id, "step": step},
+            context_used={
+                "request_id": request.request_id,
+                "step": step,
+                "reward_score": reward_signal.composite_score,
+                "security_violations": len(resp_check.violations),
+            },
         )
 
         # Store result for cross-agent context
@@ -393,6 +499,8 @@ Rules:
             ctx.session.id, f"{agent_name}_result", response.output
         )
         ctx.session.state[f"{agent_name}_result"] = response.output
+        # Store reward signal on session state for consolidation
+        ctx.session.state[f"{agent_name}_reward"] = reward_signal.composite_score
 
         return response
 
@@ -460,6 +568,27 @@ Rules:
 
         self.tracer.start_session(trace_id, query)
 
+        # ── 0. INPUT SECURITY CHECK ──────────────────────────────────────────
+        sec = self._get_security()
+        input_check = sec.check_input(query, session_id=ctx.session.id)
+        if input_check.sanitized_text:
+            query = input_check.sanitized_text
+        if input_check.has_blocking:
+            blocked_msg = f"[SECURITY] Request blocked: {input_check.summary()}"
+            self.tracer.log(
+                trace_id=trace_id, orchestrator=self.orchestrator_name,
+                step_type=StepType.ERROR, step_name="input_security_block",
+                agent=self.name, input_data=query,
+                output_data=blocked_msg,
+                reasoning=input_check.summary(),
+                success=False, error=blocked_msg,
+            )
+            self.tracer.end_session(trace_id, blocked_msg, success=False)
+            yield _make_text_event(self.name, blocked_msg)
+            return
+
+        session_start_ms = time.time() * 1000
+
         # ── 1. PLAN ──────────────────────────────────────────────────────────
         plan = await self._build_plan(query, trace_id, session_context)
 
@@ -499,12 +628,42 @@ Rules:
         )
         final_text = final_resp.output
 
-        # ── 4. LEARN ─────────────────────────────────────────────────────────
+        # ── 3b. Output security check ────────────────────────────────────────
+        output_check = sec.check_output(final_text)
+        if output_check.sanitized_text:
+            final_text = output_check.sanitized_text
+        if output_check.has_blocking:
+            final_text = f"[SECURITY] Output blocked: {output_check.summary()}"
+
+        # ── 4. REWARD & LEARN ────────────────────────────────────────────────
+        reward = self._get_reward()
+        # Collect per-agent reward signals stored during execution
+        agent_reward_scores: Dict[str, float] = {
+            name: float(ctx.session.state.get(f"{name}_reward", 0.5))
+            for name in agent_responses.keys()
+        }
+        total_duration_ms = time.time() * 1000 - session_start_ms
+        exec_reward = reward.score_execution(
+            trace_id=trace_id,
+            session_id=ctx.session.id,
+            query_type=plan.intent,
+            agent_signals={},   # signals already scored per-agent above
+            total_duration_ms=total_duration_ms,
+        )
+        # Compute session score from stored per-agent scores
+        session_score = (
+            sum(agent_reward_scores.values()) / len(agent_reward_scores)
+            if agent_reward_scores else 0.5
+        )
+
         self.context_manager.record_success(
             query_summary=query[:120],
             query_type=plan.intent,
             agents_used=list(agent_responses.keys()),
             reasoning=plan.reasoning,
+            reward_score=session_score,
+            session_score=session_score,
+            agent_scores=agent_reward_scores,
         )
         self.tracer.log(
             trace_id=trace_id,
@@ -513,10 +672,12 @@ Rules:
             step_name="record_learning",
             agent=self.name,
             input_data=query,
-            output_data="Recorded successful execution",
+            output_data="Recorded successful execution with reward scores",
             reasoning=(
                 f"Intent={plan.intent}, agents={list(agent_responses.keys())}, "
-                f"avg_confidence={sum(r.confidence for r in agent_responses.values()) / max(len(agent_responses),1):.0%}"
+                f"avg_confidence={sum(r.confidence for r in agent_responses.values()) / max(len(agent_responses),1):.0%}, "
+                f"session_reward={session_score:.0%}, "
+                f"agent_rewards={agent_reward_scores}"
             ),
         )
 

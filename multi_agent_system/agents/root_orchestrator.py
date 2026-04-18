@@ -29,6 +29,8 @@ from agents.specialist_agents import (
 )
 from config.llm_config import LLMConfig, get_llm_config
 from context.context_manager import ContextManager
+from reward.reward_engine import RewardEngine
+from security.security_layer import SecurityLayer
 from trace.tracer import AgentTracer
 
 
@@ -50,6 +52,8 @@ def build_root_orchestrator(
     context_manager: ContextManager,
     tracer: AgentTracer,
     llm_config: LLMConfig | None = None,
+    security: SecurityLayer | None = None,
+    reward_engine: RewardEngine | None = None,
 ) -> RootOrchestrator:
     """
     Build and return a fully wired RootOrchestrator.
@@ -61,12 +65,17 @@ def build_root_orchestrator(
       - summary_agent        (Agent 5 — consolidation)
     """
     cfg = llm_config or get_llm_config()
+    # Shared security + reward — created once, passed to all orchestrators
+    sec = security or SecurityLayer()
+    reward = reward_engine or RewardEngine()
     registry = AgentRegistry()
 
     # ── Agent 2: DomainOrchestrator ─────────────────────────────────────────
     # Re-uses the same shared context_manager, tracer, AND llm_config so all
     # nested traces appear in the same session using the same provider.
-    domain_orch = build_domain_orchestrator(context_manager, tracer, llm_config=cfg)
+    domain_orch = build_domain_orchestrator(
+        context_manager, tracer, llm_config=cfg, security=sec, reward_engine=reward
+    )
 
     registry.register(
         domain_orch,
@@ -157,6 +166,8 @@ def build_root_orchestrator(
         context_manager=context_manager,
         tracer=tracer,
         llm_config=cfg,
+        security=sec,
+        reward_engine=reward,
     )
 
     return orchestrator

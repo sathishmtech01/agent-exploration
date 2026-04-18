@@ -39,6 +39,8 @@ from agents.root_orchestrator import build_root_orchestrator
 from config.llm_config import get_llm_config
 from context.context_manager import ContextManager
 from models.io_models import AgentInput, AgentOutput, AgentTaskResult
+from reward.reward_engine import RewardEngine
+from security.security_layer import SecurityLayer
 from trace.tracer import AgentTracer
 
 console = Console()
@@ -56,7 +58,14 @@ def build_system() -> tuple[Runner, ContextManager, AgentTracer, InMemorySession
     llm_cfg = get_llm_config()
     context_manager = ContextManager()
     tracer = AgentTracer()
-    root = build_root_orchestrator(context_manager, tracer, llm_config=llm_cfg)
+    security = SecurityLayer()
+    reward_engine = RewardEngine()
+    root = build_root_orchestrator(
+        context_manager, tracer,
+        llm_config=llm_cfg,
+        security=security,
+        reward_engine=reward_engine,
+    )
 
     session_service = InMemorySessionService()
     runner = Runner(
